@@ -1,126 +1,77 @@
 
-import sqlite3
-from contextlib import closing
-from datetime import datetime, date, time as dtime
+import os
+from datetime import date, time as dtime
 import calendar
 import pandas as pd
 import streamlit as st
+from supabase import create_client, Client
 
-DB_PATH = "agenda.db"
+SB_URL = st.secrets["SUPABASE_URL"]
+SB_KEY = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(SB_URL, SB_KEY)
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS clients (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    phone TEXT,
-    address TEXT,
-    notes TEXT
-);
-CREATE TABLE IF NOT EXISTS services (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    service_date TEXT NOT NULL,
-    service_time TEXT,
-    client_id INTEGER,
-    service_type TEXT,
-    amount REAL DEFAULT 0,
-    status TEXT CHECK(status IN ('Pagado','Pendiente')) DEFAULT 'Pendiente',
-    notes TEXT,
-    FOREIGN KEY(client_id) REFERENCES clients(id)
-);
-"""
-
-def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        for stmt in SCHEMA.strip().split(";"):
-            s = stmt.strip()
-            if s:
-                cur.execute(s + ";")
-        con.commit()
-
-@st.cache_data(ttl=5.0)
 def get_clients_df():
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        return pd.read_sql_query("SELECT id, name, phone, address, notes FROM clients ORDER BY name", con)
+    res = supabase.table("clients").select("id,name,phone,address,notes").order("name").execute()
+    data = res.data or []
+    return pd.DataFrame(data, columns=["id","name","phone","address","notes"])
 
-@st.cache_data(ttl=5.0)
 def get_services_df(start=None, end=None):
-    query = "SELECT s.id, s.service_date, s.service_time, c.name as client, c.phone, c.address, s.service_type, s.amount, s.status, s.notes, s.client_id FROM services s LEFT JOIN clients c ON c.id=s.client_id"
-    params = []
+    q = supabase.table("services").select("id,service_date,service_time,client_id,service_type,amount,status,notes, clients(name,phone,address)").order("service_date").order("service_time", desc=False)
     if start and end:
-        query += " WHERE date(s.service_date) >= date(?) AND date(s.service_date) < date(?)"
-        params = [start, end]
-    query += " ORDER BY s.service_date, s.service_time"
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        df = pd.read_sql_query(query, con, params=params, parse_dates=["service_date"])
-    # 🔧 Mostrar solo la fecha sin hora en la tabla
-    if not df.empty and "service_date" in df.columns:
-        try:
-            df["service_date"] = pd.to_datetime(df["service_date"]).dt.date
-        except Exception:
-            pass
+        q = q.gte("service_date", start).lt("service_date", end)
+    res = q.execute()
+    rows = res.data or []
+    for r in rows:
+        c = r.get("clients") or {}
+        r["client"] = c.get("name")
+        r["phone"] = c.get("phone")
+        r["address"] = c.get("address")
+    df = pd.DataFrame(rows, columns=["id","service_date","service_time","client","phone","address","service_type","amount","status","notes","client_id"])
+    if not df.empty:
+        df["service_date"] = pd.to_datetime(df["service_date"]).dt.date
     return df
 
 def add_client(name, phone, address, notes):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("INSERT INTO clients (name, phone, address, notes) VALUES (?,?,?,?)",
-                    (name.strip(), phone.strip(), address.strip(), notes.strip()))
-        con.commit()
+    payload = {"name": name.strip(), "phone": phone.strip(), "address": address.strip(), "notes": notes.strip()}
+    res = supabase.table("clients").insert(payload).execute()
+    return res.data[0]["id"]
 
 def update_client(client_id, name, phone, address, notes):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("""UPDATE clients SET name=?, phone=?, address=?, notes=? WHERE id=?""",
-                    (name.strip(), phone.strip(), address.strip(), notes.strip(), int(client_id)))
-        con.commit()
+    supabase.table("clients").update({"name":name.strip(), "phone":phone.strip(), "address":address.strip(), "notes":notes.strip()}).eq("id", client_id).execute()
 
 def delete_client(client_id):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        # Primero ponemos a NULL client_id en services
-        cur.execute("UPDATE services SET client_id=NULL WHERE client_id=?", (int(client_id),))
-        cur.execute("DELETE FROM clients WHERE id=?", (int(client_id),))
-        con.commit()
+    supabase.table("services").update({"client_id": None}).eq("client_id", client_id).execute()
+    supabase.table("clients").delete().eq("id", client_id).execute()
 
 def add_service(service_date, service_time, client_id, service_type, amount, status, notes):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("""INSERT INTO services
-            (service_date, service_time, client_id, service_type, amount, status, notes)
-            VALUES (?,?,?,?,?,?,?)""",
-            (service_date, service_time, client_id, service_type, amount, status, notes))
-        con.commit()
+    payload = {
+        "service_date": service_date,
+        "service_time": service_time,
+        "client_id": client_id,
+        "service_type": service_type.strip(),
+        "amount": float(amount),
+        "status": status,
+        "notes": notes.strip()
+    }
+    supabase.table("services").insert(payload).execute()
 
 def get_service_by_id(service_id):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("""SELECT id, service_date, service_time, client_id, service_type, amount, status, notes
-                       FROM services WHERE id=?""", (int(service_id),))
-        row = cur.fetchone()
-        if not row:
-            return None
-        keys = ["id","service_date","service_time","client_id","service_type","amount","status","notes"]
-        return dict(zip(keys, row))
+    res = supabase.table("services").select("*").eq("id", service_id).single().execute()
+    return res.data
 
 def update_service(service_id, service_date, service_time, client_id, service_type, amount, status, notes):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("""UPDATE services SET
-                       service_date=?, service_time=?, client_id=?, service_type=?, amount=?, status=?, notes=?
-                       WHERE id=?""",
-                    (service_date, service_time, client_id, service_type, amount, status, notes, int(service_id)))
-        con.commit()
+    supabase.table("services").update({
+        "service_date": service_date,
+        "service_time": service_time,
+        "client_id": client_id,
+        "service_type": service_type.strip(),
+        "amount": float(amount),
+        "status": status,
+        "notes": notes.strip()
+    }).eq("id", service_id).execute()
 
 def delete_service(service_id):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.cursor()
-        cur.execute("DELETE FROM services WHERE id=?", (int(service_id),))
-        con.commit()
-
-def update_cache():
-    get_clients_df.clear()
-    get_services_df.clear()
+    supabase.table("services").delete().eq("id", service_id).execute()
 
 def month_bounds(year:int, month:int):
     first = date(year, month, 1)
@@ -131,32 +82,30 @@ def month_bounds(year:int, month:int):
     return first, nxt
 
 def export_excel(start, end):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        servicios = pd.read_sql_query("""
-            SELECT s.service_date as Fecha, s.service_time as Hora, c.name as Cliente, c.phone as Telefono,
-                   c.address as Direccion, s.service_type as Servicio, s.amount as Monto, s.status as Estatus, s.notes as Observaciones
-            FROM services s LEFT JOIN clients c ON c.id=s.client_id
-            WHERE date(s.service_date) >= date(?) AND date(s.service_date) < date(?)
-            ORDER BY s.service_date, s.service_time
-        """, con, params=[start, end])
-        if not servicios.empty and "Fecha" in servicios.columns:
-            try:
-                servicios["Fecha"] = pd.to_datetime(servicios["Fecha"]).dt.date
-            except Exception:
-                pass
-        clientes = pd.read_sql_query("""SELECT name as Cliente, phone as Telefono, address as Direccion, notes as Notas FROM clients ORDER BY name""", con)
-    buf = pd.ExcelWriter("export_agenda.xlsx", engine="openpyxl")
-    servicios.to_excel(buf, index=False, sheet_name="Agenda")
-    clientes.to_excel(buf, index=False, sheet_name="Clientes")
-    buf.close()
+    df = get_services_df(start, end)
+    clientes = get_clients_df()
+    out1 = df.rename(columns={
+        "service_date":"Fecha",
+        "service_time":"Hora",
+        "client":"Cliente",
+        "phone":"Teléfono",
+        "address":"Dirección",
+        "service_type":"Servicio",
+        "amount":"Monto",
+        "status":"Estatus",
+        "notes":"Observaciones",
+    })[["Fecha","Hora","Cliente","Teléfono","Dirección","Servicio","Monto","Estatus","Observaciones"]]
+    out2 = clientes.rename(columns={"name":"Cliente","phone":"Teléfono","address":"Dirección","notes":"Notas"})[["Cliente","Teléfono","Dirección","Notas"]]
+    with pd.ExcelWriter("export_agenda.xlsx", engine="openpyxl") as xw:
+        out1.to_excel(xw, index=False, sheet_name="Agenda")
+        out2.to_excel(xw, index=False, sheet_name="Clientes")
     return "export_agenda.xlsx"
 
 def main():
-    st.set_page_config(page_title="Agenda de Trabajo — Fumigaciones Xterminio", layout="wide")
+    st.set_page_config(page_title="Agenda — Fumigaciones Xterminio (Supabase)", layout="wide")
     st.title("Agenda de Trabajo — Fumigaciones Xterminio")
-    init_db()
-
     today = date.today()
+
     col1, col2 = st.sidebar.columns(2)
     year = col1.number_input("Año", min_value=2020, max_value=2100, value=today.year, step=1)
     month = col2.number_input("Mes", min_value=1, max_value=12, value=today.month, step=1)
@@ -168,7 +117,6 @@ def main():
 
     tab_agregar, tab_agenda, tab_clientes, tab_resumen = st.tabs(["➕ Agregar", "📅 Agenda", "👥 Clientes", "📈 Resumen"])
 
-    # --- TAB: Agregar ---
     with tab_agregar:
         st.subheader("Agregar servicio")
         clients_df = get_clients_df()
@@ -177,7 +125,6 @@ def main():
 
         new_name = new_phone = new_address = new_notes = ""
         client_id = None
-
         if client_choice == "(Nuevo cliente)":
             new_name = st.text_input("Nombre del cliente *")
             new_phone = st.text_input("Teléfono")
@@ -187,8 +134,7 @@ def main():
                 if not new_name.strip():
                     st.error("El nombre del cliente es obligatorio.")
                 else:
-                    add_client(new_name, new_phone, new_address, new_notes)
-                    update_cache()
+                    client_id = add_client(new_name, new_phone, new_address, new_notes)
                     st.success("Cliente guardado.")
         else:
             row = clients_df.loc[clients_df["name"] == client_choice].iloc[0]
@@ -204,21 +150,15 @@ def main():
         notes = st.text_area("Observaciones")
 
         if st.button("Agregar servicio a la Agenda"):
-            if client_choice == "(Nuevo cliente)":
+            if client_choice == "(Nuevo cliente)" and client_id is None:
                 if not new_name.strip():
                     st.error("Debes especificar el nombre del cliente.")
                     st.stop()
-                add_client(new_name, new_phone, new_address, new_notes)
-                update_cache()
-                clients_df = get_clients_df()
-                client_row = clients_df.loc[clients_df["name"] == new_name].iloc[0]
-                client_id = int(client_row["id"])
+                client_id = add_client(new_name, new_phone, new_address, new_notes)
             add_service(service_date.isoformat(), service_time.strftime("%H:%M"),
                         client_id, service_type.strip(), float(amount), status, notes.strip())
-            update_cache()
             st.success("Servicio agregado.")
 
-    # --- TAB: Agenda ---
     with tab_agenda:
         st.subheader(f"Agenda — {calendar.month_name[int(month)]} {int(year)}")
         df = get_services_df(first.isoformat(), nxt.isoformat())
@@ -251,28 +191,29 @@ def main():
             selected_id = st.selectbox("Selecciona el ID del servicio", service_ids)
             s = get_service_by_id(selected_id)
             if s:
+                from datetime import datetime as pydt
                 try:
-                    current_date = date.fromisoformat(str(s["service_date"])[:10])
+                    current_date = pydt.fromisoformat(str(s["service_date"])).date()
                 except Exception:
-                    current_date = today
+                    current_date = date.today()
                 try:
-                    hh, mm = (str(s["service_time"] or "10:00")).split(":")[:2]
+                    hh, mm = (s.get("service_time") or "10:00").split(":")[:2]
                     current_time = dtime(int(hh), int(mm))
                 except Exception:
                     current_time = dtime(10,0)
 
                 clients_df2 = get_clients_df()
                 client_map = {row["name"]: int(row["id"]) for _, row in clients_df2.iterrows()}
-                inv_client_map = {v:k for k,v in client_map.items()}
-                current_client_name = inv_client_map.get(s["client_id"], "(Sin cliente)")
+                inv = {v:k for k,v in client_map.items()}
+                current_client_name = inv.get(s.get("client_id"), "(Sin cliente)")
                 client_name_edit = st.selectbox("Cliente", ["(Sin cliente)"] + list(client_map.keys()),
                                                 index=(["(Sin cliente)"] + list(client_map.keys())).index(current_client_name) if current_client_name in (["(Sin cliente)"] + list(client_map.keys())) else 0)
                 service_date_edit = st.date_input("Fecha", value=current_date, format="DD/MM/YYYY", key=f"edit_date_{selected_id}")
                 service_time_edit = st.time_input("Hora", value=current_time, step=300, key=f"edit_time_{selected_id}")
-                service_type_edit = st.text_input("Servicio", value=s["service_type"] or "", key=f"edit_type_{selected_id}")
-                amount_edit = st.number_input("Monto", min_value=0.0, step=50.0, value=float(s["amount"] or 0.0), key=f"edit_amount_{selected_id}")
-                status_edit = st.selectbox("Estatus", ["Pendiente","Pagado"], index=(0 if (s["status"]!="Pagado") else 1), key=f"edit_status_{selected_id}")
-                notes_edit = st.text_area("Observaciones", value=s["notes"] or "", key=f"edit_notes_{selected_id}")
+                service_type_edit = st.text_input("Servicio", value=s.get("service_type") or "", key=f"edit_type_{selected_id}")
+                amount_edit = st.number_input("Monto", min_value=0.0, step=50.0, value=float(s.get("amount") or 0.0), key=f"edit_amount_{selected_id}")
+                status_edit = st.selectbox("Estatus", ["Pendiente","Pagado"], index=(0 if (s.get("status")!="Pagado") else 1), key=f"edit_status_{selected_id}")
+                notes_edit = st.text_area("Observaciones", value=s.get("notes") or "", key=f"edit_notes_{selected_id}")
 
                 colu1, colu2 = st.columns(2)
                 if colu1.button("💾 Guardar cambios", key=f"save_{selected_id}"):
@@ -281,11 +222,9 @@ def main():
                                    service_time_edit.strftime("%H:%M"),
                                    new_client_id, service_type_edit.strip(),
                                    float(amount_edit), status_edit, notes_edit.strip())
-                    update_cache()
                     st.success("Servicio actualizado.")
                 if colu2.button("🗑️ Eliminar servicio", key=f"del_{selected_id}"):
                     delete_service(selected_id)
-                    update_cache()
                     st.warning("Servicio eliminado.")
 
         st.markdown("---")
@@ -294,7 +233,6 @@ def main():
             with open(file_path, "rb") as f:
                 st.download_button("Descargar export_agenda.xlsx", f, file_name="export_agenda.xlsx")
 
-    # --- TAB: Clientes ---
     with tab_clientes:
         st.subheader("Directorio de clientes")
         cdf = get_clients_df()
@@ -317,14 +255,11 @@ def main():
             col1, col2 = st.columns(2)
             if col1.button("💾 Guardar cambios (cliente)"):
                 update_client(cid, name_edit, phone_edit, address_edit, notes_edit)
-                update_cache()
                 st.success("Cliente actualizado.")
             if col2.button("🗑️ Eliminar cliente"):
                 delete_client(cid)
-                update_cache()
                 st.warning("Cliente eliminado (los servicios quedan sin cliente asignado).")
 
-    # --- TAB: Resumen ---
     with tab_resumen:
         st.subheader("Resumen mensual")
         df = get_services_df(first.isoformat(), nxt.isoformat())
@@ -338,13 +273,7 @@ def main():
         c3.metric("Servicios en el mes", f"{total_servicios}")
 
         if not df.empty:
-            counts = df.copy()
-            if "service_date" in counts.columns:
-                try:
-                    counts["service_date"] = pd.to_datetime(counts["service_date"]).dt.date
-                except Exception:
-                    pass
-            counts = counts.groupby("service_date").size().rename("Servicios").reset_index().rename(columns={"service_date":"Fecha"})
+            counts = df.groupby("service_date").size().rename("Servicios").reset_index().rename(columns={"service_date":"Fecha"})
             st.bar_chart(counts.set_index("Fecha"))
 
 if __name__ == "__main__":
